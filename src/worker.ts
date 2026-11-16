@@ -4,7 +4,7 @@ import { favorite, profileCard, publicProfile } from "./profile";
 import { handleOf } from "./handles";
 import { accountLink } from "./link";
 import { PROFILE_CARD_PATH } from "./lib/profile";
-import type { BackfillCandidate, BackfillResult, EdlMatch, MatchLookup, MatchLookupPlayer, PlayerMatch } from "./lib/types";
+import type { BackfillCandidate, BackfillResult, EdlImportPreview, EdlImportResult, EdlMatch, EdlRosterEntry, EdlTeam, EdlTeamField, EdlTeamSeries, MatchLookup, MatchLookupPlayer, PlayerMatch } from "./lib/types";
 
 export interface Env {
   DB: D1Database;
@@ -227,24 +227,43 @@ const linkEdl = (env: Env) => env.DB.prepare(
 const text = (s: string) => { try { return JSON.parse(`"${s}"`) as string; } catch { return s; } };
 const STR = String.raw`"((?:[^"\\]|\\.)*)"`;
 
-// Lê os dois times do cabeçalho da série (teamOne/teamTwo = {slug,name,...}) e o número e o id de cada jogo.
+// Lê os dois times do cabeçalho da série (teamOne/teamTwo = {slug,name,tag,logo,...}; tag pode ser null) e, por jogo, o vencedor e quem jogou com qual herói.
+// Só vale o bloco de cada jogo: no bloco "overall" o heroId é null.
 function parseSeries(html: string) {
-  const team = (k: string) => html.match(new RegExp(String.raw`${k}:\$R\[\d+\]=\{slug:"[\w-]+",name:${STR}`))?.[1];
-  const games = [...html.matchAll(/matchNumber:(\d+),[^{}]{0,120}?deadlockMatchId:(\d+)/g)].map((g) => ({ game: Number(g[1]), matchId: Number(g[2]) }));
-  const [one, two] = [team("teamOne"), team("teamTwo")];
-  return { teams: one && two ? `${text(one)} vs ${text(two)}` : null, games };
+  const team = (k: string) => {
+    const m = html.match(new RegExp(String.raw`${k}:\$R\[\d+\]=\{slug:"([\w-]+)",name:${STR},tag:(?:${STR}|null|void 0)(?:,logo:"([^"]*)")?`));
+    return m && { slug: m[1], name: text(m[2]), tag: m[3] === undefined ? null : text(m[3]), logo: m[4] ?? null };
+  };
+  const games = html.split(/(?=matchNumber:\d+,)/).slice(1).flatMap((g) => {
+    const head = g.match(/^matchNumber:(\d+),[^{}]{0,120}?deadlockMatchId:(\d+)/);
+    if (!head) return [];
+    const players = [...g.matchAll(new RegExp(String.raw`playerSlug:"([\w-]+)",playerAlias:${STR},[^{}]*?teamSlug:"([\w-]+)",team:\$R\[\d+\](?:=\{[^{}]*\})?,heroId:(\d+)`, "g"))]
+      .map((p) => ({ slug: p[1], alias: text(p[2]), team: p[3], hero: Number(p[4]) }));
+    return [{ game: Number(head[1]), matchId: Number(head[2]), winner: g.match(/^matchNumber:\d+,[^{}]{0,200}?winnerSlug:"([\w-]+)"/)?.[1] ?? null, players }];
+  });
+  return { one: team("teamOne"), two: team("teamTwo"), games };
 }
 
-// Baixa uma série e grava os jogos; false = página indisponível (tenta de novo depois).
+// Baixa uma série e grava jogos, quem jogou e os times; false = página indisponível (tenta de novo depois).
 async function scanSeries(env: Env, event: string, series: string, budget: Budget): Promise<boolean> {
   const html = await edlText(env, `/events/${event}/series/${series}`, budget);
   if (!html) return false;
-  const { teams, games } = parseSeries(html);
+  const { one, two, games } = parseSeries(html);
   await env.DB.batch([
-    ...games.map((g) => env.DB.prepare(
-      `INSERT INTO edl_matches (match_id, event, series, game, teams) VALUES (?,?,?,?,?)
-       ON CONFLICT(match_id) DO UPDATE SET game = excluded.game, teams = excluded.teams, event = excluded.event, series = excluded.series`,
-    ).bind(g.matchId, event, series, g.game, teams)),
+    ...[one, two].flatMap((t) => (t ? [env.DB.prepare(
+      "INSERT INTO edl_teams (slug, name, tag, logo_url) VALUES (?,?,?,?) ON CONFLICT(slug) DO UPDATE SET name = excluded.name, tag = excluded.tag, logo_url = excluded.logo_url",
+    ).bind(t.slug, t.name, t.tag, t.logo)] : [])),
+    ...games.flatMap((g) => [
+      env.DB.prepare(
+        `INSERT INTO edl_matches (match_id, event, series, game, teams, team1_slug, team2_slug, winner_slug) VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(match_id) DO UPDATE SET game = excluded.game, teams = excluded.teams, event = excluded.event, series = excluded.series,
+           team1_slug = excluded.team1_slug, team2_slug = excluded.team2_slug, winner_slug = excluded.winner_slug`,
+      ).bind(g.matchId, event, series, g.game, one && two ? `${one.name} vs ${two.name}` : null, one?.slug ?? null, two?.slug ?? null, g.winner),
+      ...g.players.map((p) => env.DB.prepare(
+        `INSERT INTO edl_match_players (match_id, player_slug, alias, team_slug, hero_id) VALUES (?,?,?,?,?)
+         ON CONFLICT(match_id, player_slug) DO UPDATE SET alias = excluded.alias, team_slug = excluded.team_slug, hero_id = excluded.hero_id`,
+      ).bind(g.matchId, p.slug, p.alias, p.team, p.hero)),
+    ]),
     env.DB.prepare("INSERT OR IGNORE INTO edl_scanned (key) VALUES (?)").bind(`${event}/${series}`),
   ]);
   return true;
@@ -310,8 +329,349 @@ async function edlMatches(env: Env): Promise<Response> {
   })));
 }
 
+// Região do EDL (EU/NA/SA/APAC) -> REGIONS do site. O EDL não tem "Brasil": times do Brasil vêm como SA com countryCode BR.
+const EDL_REGIONS: Record<string, string> = { EU: "Europa", NA: "América do Norte", SA: "América do Sul", APAC: "Ásia" };
+const edlRegion = (region?: string, country?: string) => (country === "BR" ? "Brasil" : region ? EDL_REGIONS[region] : undefined);
+
+// Os campos de cada time da masterlist vêm numa linha só: team:$R[23]={tag:"LEV",name:"Leviathan",slug:"leviathan",region:"EU",logoUrl:"...",countryCode:"RU",...}
+function parseTeams(html: string): EdlTeam[] {
+  const prop = (o: string, k: string) => { const m = o.match(new RegExp(String.raw`(?:^|,)${k}:${STR}`)); return m ? text(m[1]) : undefined; };
+  const teams = new Map<string, EdlTeam>();
+  for (const m of html.matchAll(/team:\$R\[\d+\]=\{([^{}]*\bregion:"[^{}]*)\}/g)) {
+    const slug = prop(m[1], "slug"), name = prop(m[1], "name");
+    if (!slug || !name || !/^[\w-]+$/.test(slug)) continue;
+    const country = prop(m[1], "countryCode");
+    teams.set(slug, { slug, name, tag: prop(m[1], "tag"), region: edlRegion(prop(m[1], "region"), country), countryCode: country, logoUrl: prop(m[1], "logoUrl") });
+  }
+  return [...teams.values()];
+}
+
+// A masterlist vem inteira numa página só (total:33); cacheada como a deadlock-api, com a cópia velha de reserva se o EDL cair.
+async function edlTeams(env: Env): Promise<EdlTeam[] | null> {
+  const row = await env.DB.prepare("SELECT body, fetched_at FROM api_cache WHERE cache_key = 'edl-teams'").first<{ body: string; fetched_at: number }>();
+  const now = Math.floor(Date.now() / 1000);
+  if (row && now - row.fetched_at < CACHE_TTL_SECONDS) return parse<EdlTeam[]>(row.body, []);
+  const html = await edlText(env, "/teams");
+  const teams = html ? parseTeams(html) : [];
+  if (!teams.length) return row ? parse<EdlTeam[]>(row.body, []) : null;
+  await env.DB.prepare(UPSERT_CACHE).bind("edl-teams", JSON.stringify(teams), now).run();
+  return teams;
+}
+
+async function edlTeamList(env: Env, q: string): Promise<Response> {
+  const teams = await edlTeams(env);
+  if (!teams) return bad("edl.gg indisponível, tente de novo", 502);
+  const needle = q.trim().toLowerCase();
+  return Response.json(needle ? teams.filter((t) => [t.name, t.tag, t.slug].some((v) => v?.toLowerCase().includes(needle))) : teams);
+}
+
+// Elenco (só role "player"; outros papéis, como coach, ficam de fora) e links das séries do time: {href:"/players/cakef",role:"player",slug:"cakef",alias:"Cakef",...,countryCode:"CN",...}
+async function edlTeamPage(env: Env, slug: string) {
+  const html = await edlText(env, `/teams/${slug}`);
+  if (!html) return null;
+  const roster = new Map<string, { alias: string; countryCode?: string }>();
+  for (const m of html.matchAll(new RegExp(String.raw`role:"player",slug:"([\w-]+)",alias:${STR}(?:,[^{}]*?countryCode:"([A-Z]{2,3})")?`, "g"))) {
+    roster.set(m[1], { alias: text(m[2]), countryCode: m[3] });
+  }
+  // href:"/events/<evento>/series/<série>"; as variantes "?match=match-1" são ignoradas
+  const series = [...new Set([...html.matchAll(/\/events\/([\w-]+)\/series\/([\w-]+)"/g)].map((m) => `${m[1]}/${m[2]}`))];
+  return { roster, series };
+}
+
 type CardRow = { id: string; team_id: string; name: string; account_id: number | null; extra_json: string };
 const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+
+// Cruza o elenco do EDL com o que já está no D1: account_id (via partida + herói), heróis mais jogados e carta existente.
+async function edlRoster(env: Env, teamId: string, slug: string, roster: Map<string, { alias: string; countryCode?: string }>, hint: string): Promise<EdlRosterEntry[]> {
+  // (partida, herói) -> account_id: só vale quando o herói aparece uma vez na partida; a conta mais frequente por jogador vence
+  const [accRows, heroRows] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT mp.player_slug AS slug, p.value ->> 'a' AS account, COUNT(*) AS n
+       FROM edl_match_players mp JOIN edl_matches m ON m.match_id = mp.match_id AND m.info_json IS NOT NULL, json_each(m.info_json, '$.players') p
+       WHERE mp.team_slug = ?1 AND (p.value ->> 'h') = mp.hero_id
+         AND (SELECT COUNT(*) FROM json_each(m.info_json, '$.players') q WHERE (q.value ->> 'h') = mp.hero_id) = 1
+       GROUP BY slug, account ORDER BY n DESC`).bind(slug),
+    env.DB.prepare("SELECT player_slug AS slug, hero_id AS hero, COUNT(*) AS n FROM edl_match_players WHERE team_slug = ? GROUP BY slug, hero ORDER BY n DESC").bind(slug),
+  ]);
+  const accounts = new Map<string, { id: number; n: number }[]>();
+  for (const r of accRows.results as { slug: string; account: number; n: number }[]) accounts.set(r.slug, [...(accounts.get(r.slug) ?? []), { id: r.account, n: r.n }]);
+  const heroes = new Map<string, number[]>();
+  const played = new Set<string>();
+  for (const r of heroRows.results as { slug: string; hero: number }[]) { heroes.set(r.slug, [...(heroes.get(r.slug) ?? []), r.hero]); played.add(r.slug); }
+
+  const resolved = new Map<string, number | "ambiguous">();
+  for (const [s, list] of accounts) resolved.set(s, list.length > 1 && list[0].n === list[1].n ? "ambiguous" : list[0].id);
+  const ids = [...resolved.values()].filter((v): v is number => v !== "ambiguous");
+  // só cartas base; variantes herdam o account da carta base
+  const cards = (await env.DB.prepare(
+    "SELECT id, team_id, name, account_id, extra_json FROM players WHERE (extra_json ->> '$.variantOf') IS NULL AND (team_id = ?1 OR account_id IN (SELECT value FROM json_each(?2)))",
+  ).bind(teamId, JSON.stringify(ids)).all<CardRow>()).results;
+
+  const entries = [...roster].map(([s, r]): EdlRosterEntry => {
+    const acc = resolved.get(s);
+    const accountId = typeof acc === "number" ? acc : undefined;
+    // o mesmo account pode estar em várias cartas quando são versões do mesmo jogador (mesmo nome); a do próprio time vem primeiro
+    const byAccount = accountId ? cards.filter((c) => c.account_id === accountId).sort((x, y) => Number(y.team_id === teamId) - Number(x.team_id === teamId))[0] : undefined;
+    const byName = cards.find((c) => c.team_id === teamId && norm(c.name) === norm(r.alias));
+    const found = byName && (!byAccount || byName.account_id === accountId || norm(byAccount.name) === norm(byName.name)) ? byName : byAccount ?? byName;
+    const entry: EdlRosterEntry = {
+      slug: s, alias: r.alias, ...(r.countryCode ? { countryCode: r.countryCode } : {}), ...(accountId ? { accountId } : {}),
+      heroIds: (heroes.get(s) ?? []).slice(0, 3), action: "create",
+      ...(found ? { card: { playerId: found.id, name: found.name, teamId: found.team_id, ...(found.account_id ? { accountId: found.account_id } : {}), by: found === byAccount ? "account" as const : "name" as const } } : {}),
+    };
+    if (!accountId) {
+      entry.action = "unresolved";
+      entry.reason = acc === "ambiguous" ? "mais de uma conta empatada para este jogador"
+        : hint || (played.has(s) ? "metadata das partidas indisponível na deadlock-api" : "sem partidas deste jogador com herói registrado no EDL");
+    } else if (byName && byName.account_id === accountId) entry.action = "linked";
+    else if (byName?.account_id) {
+      // Troca de conta: carta ativa do time, mesmo nome, outro account, e o account novo não é de outro jogador.
+      if (!parse<{ inactive?: boolean }>(byName.extra_json, {}).inactive && !cards.some((c) => c.account_id === accountId && norm(c.name) !== norm(byName.name))) {
+        entry.action = "relink";
+        entry.card = { playerId: byName.id, name: byName.name, teamId: byName.team_id, accountId: byName.account_id, by: "name" };
+      } else {
+        entry.action = "conflict";
+        entry.reason = `a carta "${byName.name}" já está vinculada a outra conta (${byName.account_id})`;
+      }
+    } else if (byAccount && byName && norm(byAccount.name) !== norm(byName.name)) {
+      entry.action = "conflict";
+      entry.reason = `a conta já está na carta "${byAccount.name}" e o time tem outra carta chamada "${byName.name}"`;
+    } else if (byName) entry.action = "link";
+    else if (byAccount) entry.action = "linked";
+    return entry;
+  });
+  const olds = entries.flatMap((e) => (e.action === "relink" ? [e.card!.accountId!] : []));
+  if (olds.length) {
+    const rows = (await env.DB.prepare("SELECT account_id, COUNT(*) AS n FROM player_matches WHERE account_id IN (SELECT value FROM json_each(?)) GROUP BY account_id")
+      .bind(JSON.stringify(olds)).all<{ account_id: number; n: number }>()).results;
+    for (const e of entries) if (e.action === "relink") e.oldMatches = rows.find((r) => r.account_id === e.card!.accountId)?.n ?? 0;
+  }
+  return entries;
+}
+
+// Cartas base ativas do time que não batem com ninguém do elenco do EDL, nem pelo account resolvido nem pelo nome.
+// Sem elenco (leitura do EDL falhou) ninguém é considerado como tendo saído.
+async function edlLeavers(env: Env, teamId: string, roster: EdlRosterEntry[]): Promise<CardRow[]> {
+  if (!roster.length) return [];
+  const accounts = new Set(roster.flatMap((r) => (r.accountId ? [r.accountId] : [])));
+  const names = new Set(roster.map((r) => norm(r.alias)));
+  const rows = (await env.DB.prepare("SELECT id, team_id, name, account_id, extra_json FROM players WHERE team_id = ?").bind(teamId).all<CardRow>()).results;
+  return rows.filter((c) => {
+    const x = parse<{ variantOf?: string; inactive?: boolean }>(c.extra_json, {});
+    return !x.variantOf && !x.inactive && !(c.account_id && accounts.has(c.account_id)) && !names.has(norm(c.name));
+  });
+}
+
+type TeamRow = { id: string; name: string; tag: string; region: string; logo_key: string | null; edl_slug: string | null };
+const teamRow = (env: Env, id: string) => env.DB.prepare("SELECT id, name, tag, region, logo_key, edl_slug FROM teams WHERE id = ?").bind(id).first<TeamRow>();
+
+// Descoberta limitada: varre séries do time ainda não lidas e lê o metadata das partidas pendentes dele, dentro do orçamento de subrequests;
+// o que faltar fica para o próximo clique (o aviso vai no `reason` dos jogadores sem conta).
+// shortcut: metade do orçamento para séries e o resto para metadata; times com histórico enorme levam alguns cliques para resolver todo o elenco.
+async function edlDiscover(env: Env, slug: string, series: string[], budget: Budget): Promise<string> {
+  const scanned = new Set((await env.DB.prepare("SELECT key FROM edl_scanned").all<{ key: string }>()).results.map((r) => r.key));
+  const todo = series.filter((k) => !scanned.has(k));
+  let left = todo.length;
+  for (const k of todo.slice(0, Math.ceil(budget.left / 2))) {
+    const [event, s] = k.split("/");
+    if (await scanSeries(env, event, s, budget)) left--;
+  }
+  const pending = (await env.DB.prepare("SELECT match_id FROM edl_matches WHERE done = 0 AND (team1_slug = ?1 OR team2_slug = ?1) ORDER BY match_id DESC LIMIT ?2")
+    .bind(slug, BULK_CALLS * BULK_IDS).all<{ match_id: number }>()).results;
+  await readMatches(env, pending.map((m) => m.match_id), budget);
+  const stillPending = (await env.DB.prepare("SELECT COUNT(*) AS n FROM edl_matches WHERE done = 0 AND (team1_slug = ?1 OR team2_slug = ?1)").bind(slug).first<number>("n")) ?? 0;
+  return left || stillPending ? `faltam ${left} séries e ${stillPending} partidas do time para ler; gere o preview de novo` : "";
+}
+
+async function edlPreview(env: Env, teamId: string): Promise<Response> {
+  const t = await teamRow(env, teamId);
+  if (!t) return bad("time não encontrado", 404);
+  if (!t.edl_slug) return bad("time não está ligado ao EDL", 409);
+  const team = (await edlTeams(env))?.find((e) => e.slug === t.edl_slug);
+  if (!team) return bad("time não encontrado no edl.gg", 404);
+  const page = await edlTeamPage(env, t.edl_slug);
+  if (!page) return bad("edl.gg indisponível, tente de novo", 502);
+  let roster = await edlRoster(env, t.id, t.edl_slug, page.roster, "");
+  if (roster.some((r) => r.action === "unresolved")) {
+    const hint = await edlDiscover(env, t.edl_slug, page.series, { left: SUBREQUESTS - 2 });
+    roster = await edlRoster(env, t.id, t.edl_slug, page.roster, hint);
+  }
+  const fields: EdlImportPreview["fields"] = [];
+  if (team.name !== t.name) fields.push({ key: "name", current: t.name, edl: team.name });
+  if (team.tag && team.tag !== t.tag) fields.push({ key: "tag", current: t.tag, edl: team.tag });
+  if (team.region && team.region !== t.region) fields.push({ key: "region", current: t.region, edl: team.region });
+  // O logo já salvo está no R2 e não dá para comparar com o do EDL: sempre oferece, o admin decide (vem desmarcado no front).
+  if (team.logoUrl) fields.push({ key: "logo", ...(t.logo_key ? { current: imgUrl(t.logo_key) } : {}), edl: team.logoUrl });
+  const leavers = (await edlLeavers(env, t.id, roster)).map((c): EdlImportPreview["leavers"][number] => ({ playerId: c.id, name: c.name, ...(c.account_id ? { accountId: c.account_id } : {}) }));
+  const freeAgentTeams = (await env.DB.prepare("SELECT id, name, tag FROM teams WHERE region = 'Sem Time' AND id != ? ORDER BY name").bind(t.id).all<{ id: string; name: string; tag: string }>()).results;
+  return Response.json({ team, fields, roster, leavers, freeAgentTeams } satisfies EdlImportPreview);
+}
+
+const FIELD_COLUMNS: Record<EdlTeamField, string> = { name: "name", tag: "tag", region: "region", logo: "logo_key" };
+const MAX_APPLY_ITEMS = 50;
+
+// Baixa o logo do EDL (só media.edl.gg) e grava no R2 pelo mesmo caminho do upload; devolve /img/<key>.
+async function importLogo(env: Env, logoUrl: string): Promise<string> {
+  const u = new URL(logoUrl);
+  if (u.protocol !== "https:" || u.hostname !== "media.edl.gg") throw new Error("logo fora do media.edl.gg");
+  const r = await fetch(u, { ...OUT_INIT(), redirect: "manual" });
+  const type = r.headers.get("content-type")?.split(";")[0].trim() ?? "";
+  if (!r.ok || !IMAGE_TYPES[type]) throw new Error("logo indisponível ou de tipo não suportado");
+  if (Number(r.headers.get("content-length")) > MAX_UPLOAD_BYTES) throw new Error("logo maior que 8 MB");
+  const res = await upload(env, new Request("http://upload", { method: "POST", headers: { "content-type": type }, body: await r.arrayBuffer() }), "teams");
+  if (!res.ok) throw new Error(((await res.json()) as { error: string }).error);
+  return ((await res.json()) as { url: string }).url;
+}
+
+async function heroName(env: Env, id: number | undefined): Promise<string> {
+  const r = await cachedFetch(env, "/v1/assets/heroes");
+  const list = r.ok ? ((await r.json().catch(() => [])) as { id: number; name: string }[]) : [];
+  return (Array.isArray(list) && list.find((h) => h.id === id)?.name) || "Abrams";
+}
+
+async function edlApply(env: Env, request: Request, teamId: string): Promise<Response> {
+  const b = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+  const isList = (v: unknown): v is unknown[] => Array.isArray(v) && v.length <= MAX_APPLY_ITEMS;
+  const relink = b?.relink ?? [], release = b?.release ?? [];
+  if (!b || !isList(b.fields) || !isList(b.link) || !isList(b.create) || !isList(relink) || !isList(release)) return bad("corpo inválido");
+  const fields = [...new Set(b.fields)] as EdlTeamField[];
+  if (fields.some((f) => !(f in FIELD_COLUMNS))) return bad("campo inválido");
+  const links = b.link as { playerId?: unknown; accountId?: unknown }[];
+  const relinks = relink as typeof links;
+  const releases = release as { playerId?: unknown; teamId?: unknown }[];
+  const creates = b.create as { slug?: unknown }[];
+  if ([...links, ...relinks].some((l) => typeof l?.playerId !== "string" || !ID_RE.test(l.playerId) || !Number.isInteger(l.accountId) || (l.accountId as number) <= 0 || (l.accountId as number) >= 2 ** 32)) return bad("vínculo inválido");
+  if (releases.some((r) => typeof r?.playerId !== "string" || !ID_RE.test(r.playerId) || typeof r.teamId !== "string" || !ID_RE.test(r.teamId))) return bad("movimentação inválida");
+  if (creates.some((c) => typeof c?.slug !== "string" || !/^[\w-]{1,64}$/.test(c.slug))) return bad("jogador inválido");
+
+  const t = await teamRow(env, teamId);
+  if (!t) return bad("time não encontrado", 404);
+  if (!t.edl_slug) return bad("time não está ligado ao EDL", 409);
+  const skipped: EdlImportResult["skipped"] = [];
+  const stmts: D1PreparedStatement[] = [];
+  const result: EdlImportResult["applied"] = { fields: [], linked: [], created: [], relinked: [], released: [] };
+
+  if (fields.length) {
+    const team = (await edlTeams(env))?.find((e) => e.slug === t.edl_slug);
+    const values: Record<EdlTeamField, string | undefined> = { name: team?.name, tag: team?.tag, region: team?.region, logo: team?.logoUrl };
+    const set: string[] = [], binds: string[] = [];
+    for (const f of fields) {
+      try {
+        const v = values[f];
+        if (!v) throw new Error(team ? "o EDL não tem esse valor" : "time não encontrado no edl.gg");
+        const value = f === "logo" ? keyOf(await importLogo(env, v))! : v;
+        set.push(`${FIELD_COLUMNS[f]} = ?`);
+        binds.push(value);
+        result.fields.push(f);
+      } catch (e) { skipped.push({ item: f, reason: (e as Error).message }); }
+    }
+    if (set.length) stmts.push(env.DB.prepare(`UPDATE teams SET ${set.join(", ")} WHERE id = ?`).bind(...binds, t.id));
+  }
+
+  if (links.length || creates.length || relinks.length || releases.length) {
+    const page = await edlTeamPage(env, t.edl_slug);
+    if (!page) return bad("edl.gg indisponível, tente de novo", 502);
+    const roster = await edlRoster(env, t.id, t.edl_slug, page.roster, "");
+    const claimed = new Map<number, string>(), names = new Set<string>(), touched = new Set<string>();
+    for (const l of links as { playerId: string; accountId: number }[]) {
+      const skip = (reason: string) => skipped.push({ item: l.playerId, reason });
+      const card = await env.DB.prepare("SELECT id, name, account_id, extra_json FROM players WHERE id = ?").bind(l.playerId).first<{ id: string; name: string; account_id: number | null; extra_json: string }>();
+      // outras cartas com esse account só atrapalham se tiverem nome diferente (versões do mesmo jogador compartilham o account)
+      const others = (await env.DB.prepare("SELECT name FROM players WHERE account_id = ? AND id != ?").bind(l.accountId, l.playerId).all<{ name: string }>()).results;
+      if (!roster.some((r) => r.accountId === l.accountId)) skip("conta fora do elenco resolvido do time");
+      else if (!card) skip("carta não existe");
+      else if (parse<{ variantOf?: string }>(card.extra_json, {}).variantOf) skip("só cartas base podem ser vinculadas");
+      else if (card.account_id) skip(card.account_id === l.accountId ? "carta já vinculada a essa conta" : "carta já vinculada a outra conta");
+      else if (others.some((o) => norm(o.name) !== norm(card.name)) || (claimed.has(l.accountId) && claimed.get(l.accountId) !== norm(card.name)) || touched.has(l.playerId)) skip("conta já usada em outra carta ou neste pedido");
+      else {
+        claimed.set(l.accountId, norm(card.name)); touched.add(l.playerId); result.linked.push(l.playerId);
+        stmts.push(env.DB.prepare("UPDATE players SET account_id = ? WHERE id = ? AND account_id IS NULL").bind(l.accountId, l.playerId));
+      }
+    }
+    for (const l of relinks as { playerId: string; accountId: number }[]) {
+      const skip = (reason: string) => skipped.push({ item: l.playerId, reason });
+      const card = await env.DB.prepare("SELECT id, team_id, name, account_id, extra_json FROM players WHERE id = ?").bind(l.playerId).first<CardRow>();
+      const entry = roster.find((r) => r.accountId === l.accountId);
+      const others = (await env.DB.prepare("SELECT name FROM players WHERE account_id = ? AND id != ? AND (extra_json ->> '$.variantOf') IS NULL").bind(l.accountId, l.playerId).all<{ name: string }>()).results;
+      const x = parse<{ variantOf?: string; inactive?: boolean }>(card?.extra_json ?? "{}", {});
+      if (!entry) skip("conta fora do elenco resolvido do time");
+      else if (!card) skip("carta não existe");
+      else if (x.variantOf || x.inactive) skip("só cartas base ativas podem trocar de conta");
+      else if (card.team_id !== t.id) skip("carta de outro time");
+      else if (norm(card.name) !== norm(entry.alias)) skip("o nome da carta não bate com o jogador do EDL");
+      else if (!card.account_id) skip("carta sem conta: use vincular");
+      else if (card.account_id === l.accountId) skip("carta já vinculada a essa conta");
+      else if (others.some((o) => norm(o.name) !== norm(card.name)) || (claimed.has(l.accountId) && claimed.get(l.accountId) !== norm(card.name)) || touched.has(l.playerId)) skip("conta já usada em outra carta ou neste pedido");
+      else {
+        claimed.set(l.accountId, norm(card.name)); touched.add(l.playerId); result.relinked.push(l.playerId);
+        stmts.push(env.DB.prepare("UPDATE players SET account_id = ? WHERE id = ? AND account_id = ?").bind(l.accountId, l.playerId, card.account_id));
+      }
+    }
+    if (releases.length) {
+      const leavers = new Set((await edlLeavers(env, t.id, roster)).map((c) => c.id));
+      for (const r of releases as { playerId: string; teamId: string }[]) {
+        const skip = (reason: string) => skipped.push({ item: r.playerId, reason });
+        if (!leavers.has(r.playerId)) skip("a carta não saiu do elenco do EDL");
+        else if (r.teamId === t.id || !(await env.DB.prepare("SELECT 1 FROM teams WHERE id = ? AND region = 'Sem Time'").bind(r.teamId).first())) skip("o destino não é um time com região Sem Time");
+        else if (touched.has(r.playerId)) skip("carta já usada neste pedido");
+        else {
+          touched.add(r.playerId); result.released.push(r.playerId);
+          stmts.push(env.DB.prepare("UPDATE players SET team_id = ? WHERE id = ? AND team_id = ?").bind(r.teamId, r.playerId, t.id));
+        }
+      }
+    }
+    const stats = { MIR: 88, MAC: 86, SUP: 82, MOV: 87, POL: 85, CON: 86 };
+    for (const c of creates as { slug: string }[]) {
+      const r = roster.find((e) => e.slug === c.slug);
+      const skip = (reason: string) => skipped.push({ item: c.slug, reason });
+      if (!r) skip("jogador fora do elenco do EDL");
+      else if (!r.accountId) skip(r.reason ?? "conta não resolvida");
+      else if (r.action !== "create") skip(r.card ? `já existe a carta "${r.card.name}"` : r.reason ?? "não pode ser criada");
+      else if (claimed.has(r.accountId) || names.has(norm(r.alias))) skip("já criado ou vinculado neste pedido");
+      else if (await env.DB.prepare("SELECT 1 FROM players WHERE account_id = ?").bind(r.accountId).first()) skip("já existe carta com essa conta");
+      else {
+        claimed.set(r.accountId, norm(r.alias)); names.add(norm(r.alias));
+        const id = `p-${crypto.randomUUID().slice(0, 8)}`;
+        result.created.push(id);
+        // valores padrão iguais ao blankPlayer do Editor
+        stmts.push(env.DB.prepare(
+          "INSERT INTO players (id, team_id, name, position, hero, stats_json, ovr, c1, c2, history_json, extra_json, account_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ).bind(id, t.id, r.alias, "Flex", await heroName(env, r.heroIds[0]), JSON.stringify(stats), Math.round(Object.values(stats).reduce((a, v) => a + v, 0) / 6),
+          "#0e7490", "#082f49", "[]", JSON.stringify({ footer: "Deadlock Cards" }), r.accountId));
+      }
+    }
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  if (result.linked.length || result.created.length || result.relinked.length) await linkEdl(env);
+  return Response.json({ applied: result, skipped } satisfies EdlImportResult);
+}
+
+async function edlSeries(env: Env, teamId: string): Promise<Response> {
+  const slug = await env.DB.prepare("SELECT edl_slug FROM teams WHERE id = ?").bind(teamId).first<string | null>("edl_slug");
+  if (!slug) return Response.json([]);
+  const rows = (await env.DB.prepare(
+    `SELECT match_id, event, series, game, team1_slug AS one, team2_slug AS two, winner_slug AS winner, info_json ->> 'start' AS start
+     FROM edl_matches WHERE (team1_slug = ?1 OR team2_slug = ?1) AND winner_slug IS NOT NULL ORDER BY game`,
+  ).bind(slug).all<{ match_id: number; event: string; series: string; game: number | null; one: string; two: string; winner: string; start: number | null }>()).results;
+  const groups = new Map<string, typeof rows>();
+  for (const r of rows) groups.set(`${r.event}/${r.series}`, [...(groups.get(`${r.event}/${r.series}`) ?? []), r]);
+  const start = (g: typeof rows) => Math.min(...g.map((r) => r.start ?? Infinity));
+  const recent = [...groups.values()].sort((a, b) => (Number.isFinite(start(b)) ? start(b) : 0) - (Number.isFinite(start(a)) ? start(a) : 0) || b[0].match_id - a[0].match_id).slice(0, 20);
+  const opponents = new Map((await env.DB.prepare("SELECT slug, name, tag, logo_url FROM edl_teams WHERE slug IN (SELECT value FROM json_each(?))")
+    .bind(JSON.stringify(recent.map((g) => (g[0].one === slug ? g[0].two : g[0].one)))).all<{ slug: string; name: string; tag: string | null; logo_url: string | null }>()).results.map((o) => [o.slug, o]));
+  return Response.json(recent.map((g): EdlTeamSeries => {
+    const opp = g[0].one === slug ? g[0].two : g[0].one;
+    const wins = g.filter((r) => r.winner === slug).length;
+    const o = opponents.get(opp);
+    const first = start(g);
+    return {
+      event: g[0].event, series: g[0].series,
+      opponent: { name: o?.name ?? opp, ...(o?.tag ? { tag: o.tag } : {}), ...(o?.logo_url ? { logoUrl: o.logo_url } : {}) },
+      score: [wins, g.length - wins], won: wins > g.length - wins, ...(Number.isFinite(first) ? { startTime: first } : {}),
+      games: g.map((r, i) => ({ matchId: r.match_id, game: r.game ?? i + 1, won: r.winner === slug })),
+    };
+  }));
+}
 
 // Versões do mesmo jogador são cartas separadas (variantOf ou só o mesmo nome); o backfill copia o account da carta de origem para elas, sempre manual.
 // shortcut: lê todas as outras cartas e filtra em JS, trocar por SQL se o número de cartas passar de alguns milhares
@@ -406,7 +766,7 @@ async function appData(env: Env): Promise<Response> {
   return Response.json({
     teams: (teams.results as Record<string, string | null>[]).map((t) => {
       const tbg = parse<Record<string, unknown> | null>(t.bg_json, null);
-      return { id: t.id, name: t.name, tag: t.tag, region: t.region, logo: imgUrl(t.logo_key), ...(tbg ? { bg: tbg } : {}) };
+      return { id: t.id, name: t.name, tag: t.tag, region: t.region, logo: imgUrl(t.logo_key), ...(t.edl_slug ? { edlSlug: t.edl_slug } : {}), ...(tbg ? { bg: tbg } : {}) };
     }),
     players: (players.results as Record<string, string | number | null>[]).map((p) => ({
       ...parse(p.extra_json as string, {}),
@@ -474,10 +834,14 @@ async function write(env: Env, request: Request, kind: string, id: string): Prom
     if (del) await db.batch([db.prepare("DELETE FROM players WHERE team_id = ?").bind(id), db.prepare("DELETE FROM teams WHERE id = ?").bind(id)]);
     else {
       if (!b.name || !b.tag) return bad("time incompleto");
+      // edlSlug ausente mantém o valor salvo; null desliga
+      const edlSlug = b.edlSlug === undefined ? null : b.edlSlug;
+      if (edlSlug !== null && !(typeof edlSlug === "string" && /^[a-z0-9-]{1,64}$/.test(edlSlug))) return bad("edlSlug inválido");
+      if (edlSlug && await db.prepare("SELECT 1 FROM teams WHERE edl_slug = ? AND id != ?").bind(edlSlug, id).first()) return bad("esse time do EDL já está ligado a outro time", 409);
       await db.prepare(
-        "INSERT INTO teams (id, name, tag, region, logo_key, bg_json) VALUES (?,?,?,?,?,?) " +
-        "ON CONFLICT(id) DO UPDATE SET name=excluded.name, tag=excluded.tag, region=excluded.region, logo_key=excluded.logo_key, bg_json=excluded.bg_json",
-      ).bind(id, b.name, b.tag, b.region ?? "Europa", keyOf(b.logo), b.bg ? JSON.stringify(b.bg) : null).run();
+        "INSERT INTO teams (id, name, tag, region, logo_key, bg_json, edl_slug) VALUES (?,?,?,?,?,?,?) " +
+        "ON CONFLICT(id) DO UPDATE SET name=excluded.name, tag=excluded.tag, region=excluded.region, logo_key=excluded.logo_key, bg_json=excluded.bg_json, edl_slug=CASE WHEN ? THEN excluded.edl_slug ELSE teams.edl_slug END",
+      ).bind(id, b.name, b.tag, b.region ?? "Europa", keyOf(b.logo), b.bg ? JSON.stringify(b.bg) : null, edlSlug, b.edlSlug === undefined ? 0 : 1).run();
     }
   } else if (kind === "heroes") {
     if (del) await db.prepare("DELETE FROM heroes WHERE name = ?").bind(id).run();
@@ -648,6 +1012,19 @@ export default {
       if (request.method !== "POST") return bad("método não suportado", 405);
       await syncEdl(env, newBudget());
       return Response.json({ total: (await env.DB.prepare("SELECT COUNT(*) AS n FROM edl_matches").first<number>("n")) ?? 0 });
+    }
+    if (url.pathname === "/api/edl/teams") {
+      if (!(await currentUser(env, request))?.admin) return bad("sem permissão", 403);
+      return request.method === "GET" ? edlTeamList(env, url.searchParams.get("q") ?? "") : bad("método não suportado", 405);
+    }
+    const teamEdl = url.pathname.match(/^\/api\/teams\/([^/]+)\/(edl-import|edl-series)$/);
+    if (teamEdl) {
+      const id = decodeURIComponent(teamEdl[1]);
+      if (!ID_RE.test(id)) return bad("id inválido");
+      if (teamEdl[2] === "edl-series") return request.method === "GET" ? edlSeries(env, id) : bad("método não suportado", 405);
+      if (!(await currentUser(env, request))?.admin) return bad("sem permissão", 403);
+      if (request.method === "GET") return edlPreview(env, id);
+      return request.method === "POST" ? edlApply(env, request, id) : bad("método não suportado", 405);
     }
     const lookup = url.pathname.match(/^\/api\/match-lookup\/([^/]+)$/);
     if (lookup) {
