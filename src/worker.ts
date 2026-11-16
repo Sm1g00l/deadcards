@@ -4,7 +4,7 @@ import { favorite, profileCard, publicProfile } from "./profile";
 import { handleOf } from "./handles";
 import { accountLink } from "./link";
 import { PROFILE_CARD_PATH } from "./lib/profile";
-import type { BackfillCandidate, BackfillResult, EdlImportPreview, EdlImportResult, EdlMatch, EdlRosterEntry, EdlTeam, EdlTeamField, EdlTeamSeries, MatchLookup, MatchLookupPlayer, PlayerMatch } from "./lib/types";
+import type { BackfillCandidate, BackfillResult, EdlImportPreview, EdlImportResult, EdlMatch, EdlRosterEntry, EdlTeam, EdlTeamField, EdlTeamSeries, MatchLookup, MatchLookupPlayer, PlayerMatch, SyncStatus } from "./lib/types";
 
 export interface Env {
   DB: D1Database;
@@ -78,8 +78,12 @@ const BULK_CALLS = 2;
 // A API leva de ~1 s a ~12 s conforme a janela e o limite (504 acima de ~20 s): ~5 KB por partida, 150 partidas = ~0,7 MB.
 const PUB_ACCOUNTS = 30;
 const PUB_LIMIT = 150;
-// Janela dos pubs: só os últimos 14 dias, mais recentes primeiro (shortcut: o que passar de PUB_LIMIT partidas na janela fica de fora, guardar a última leitura por conta se isso importar).
+// Conta nunca sincronizada busca só os últimos 14 dias (shortcut: histórico mais antigo fica de fora, subir se importar).
 const PUB_LOOKBACK_S = 14 * 86400;
+// Partida em andamento quando a conta foi sincronizada só aparece depois: relê a última hora para não perdê-la.
+const PUB_OVERLAP_S = 3600;
+// Contas sincronizadas há menos que isso são puladas no rodízio.
+const SYNC_FRESH_S = 20 * 3600;
 // 429/503: espera o Retry-After se for curto (ou 1 s, 2 s sem o header), no máximo MAX_RETRIES vezes. Retry-After longo, 504 ou tentativas
 // esgotadas colocam a rota em pausa (api_cache `pause:<rota>`) e os próximos lotes a pulam até a hora marcada.
 const MAX_RETRIES = 2;
@@ -182,29 +186,46 @@ const INSERT_MATCH_JSON =
 
 const matchCount = (env: Env) => env.DB.prepare("SELECT COUNT(*) AS n FROM player_matches").first<number>("n").then((n) => n ?? 0);
 
-// Só as partidas dos últimos 14 dias de várias contas numa chamada (modo padrão = ranked + unranked, os pubs), mais recentes primeiro.
-// Resposta 200 ou 404 (nenhuma partida) é definitiva; qualquer outra (limite, erro, rede) deixa tudo como estava para tentar no próximo ciclo.
+// Só as partidas novas de várias contas numa chamada (modo padrão = ranked + unranked, os pubs). Resposta 200 ou 404 (nenhuma partida nova)
+// marca as contas como sincronizadas; qualquer outra (limite, erro, rede) deixa tudo como estava para tentar no próximo lote.
+// Mais antigas primeiro: se a resposta bateu em PUB_LIMIT, o sync avança só até a última partida lida e o resto vem no lote seguinte.
 // shortcut: guarda só as 100 partidas mais recentes por jogador, subir PUB_HISTORY_LIMIT se o histórico completo importar
 async function syncPubs(env: Env, ids: number[], budget: Budget): Promise<void> {
   const idsJson = JSON.stringify(ids);
-  const { status, data } = await dlGet<RawMeta[]>(env, `/v1/matches/metadata?account_ids=${ids.join(",")}&min_unix_timestamp=${nowS() - PUB_LOOKBACK_S}`
-    + `&include_info=true&include_player_info=true&include_player_kda=true&only_filtered_players=true&order_by=start_time&order_direction=desc&limit=${PUB_LIMIT}`, budget);
+  const known = (await env.DB.prepare("SELECT synced_at FROM account_sync WHERE account_id IN (SELECT value FROM json_each(?))").bind(idsJson).all<{ synced_at: number }>()).results;
+  const since = Math.max(nowS() - PUB_LOOKBACK_S, known.length < ids.length ? 0 : Math.min(...known.map((k) => k.synced_at)));
+  const { status, data } = await dlGet<RawMeta[]>(env, `/v1/matches/metadata?account_ids=${ids.join(",")}&min_unix_timestamp=${since - PUB_OVERLAP_S}`
+    + `&include_info=true&include_player_info=true&include_player_kda=true&only_filtered_players=true&order_by=start_time&order_direction=asc&limit=${PUB_LIMIT}`, budget);
   if (status !== 200 && status !== 404) return;
+  const matches = (Array.isArray(data) ? data : []).filter((m) => Number.isInteger(m.match_id));
   const wanted = new Set(ids);
-  const rows = (Array.isArray(data) ? data : []).filter((m) => Number.isInteger(m.match_id)).flatMap((m) => {
+  const rows = matches.flatMap((m) => {
     const info = toInfo(m);
     return info.players.filter((p) => wanted.has(p.account_id)).map((p) => ({
       a: p.account_id, m: m.match_id, h: num(p.hero_id, 0), s: num(info.start_time, 0), d: num(info.duration_s, 0),
       k: num(p.kills, 0), de: num(p.deaths, 0), as: num(p.assists, 0), nw: num(p.net_worth, 0), w: p.team === info.winning_team ? 1 : 0,
     }));
   });
+  const syncedAt = matches.length >= PUB_LIMIT ? toInfo(matches[matches.length - 1]).start_time : nowS();
   await env.DB.batch([
     env.DB.prepare(INSERT_MATCH_JSON + "ON CONFLICT(account_id, match_id) DO NOTHING").bind(JSON.stringify(rows)),
     env.DB.prepare(
       `DELETE FROM player_matches WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY start_time DESC) AS n
          FROM player_matches WHERE source = 'pub' AND account_id IN (SELECT value FROM json_each(?))) WHERE n > ?)`,
     ).bind(idsJson, PUB_HISTORY_LIMIT),
+    env.DB.prepare("INSERT INTO account_sync (account_id, synced_at) SELECT value, ? FROM json_each(?) WHERE true ON CONFLICT(account_id) DO UPDATE SET synced_at = excluded.synced_at")
+      .bind(syncedAt, idsJson),
   ]);
+}
+
+// Rodízio: contas nunca sincronizadas primeiro (NULL ordena antes), depois as mais antigas; as sincronizadas há pouco ficam de fora.
+const STALE = "p.account_id IS NOT NULL AND (s.synced_at IS NULL OR s.synced_at < ?)";
+const STALE_FROM = "FROM players p LEFT JOIN account_sync s ON s.account_id = p.account_id";
+
+async function syncStalePubs(env: Env, budget: Budget): Promise<void> {
+  const stale = (await env.DB.prepare(`SELECT p.account_id ${STALE_FROM} WHERE ${STALE} GROUP BY p.account_id ORDER BY s.synced_at LIMIT ?`)
+    .bind(nowS() - SYNC_FRESH_S, PUB_ACCOUNTS).all<{ account_id: number }>()).results;
+  if (stale.length) await syncPubs(env, stale.map((r) => r.account_id), budget);
 }
 
 async function edlText(env: Env, path: string, budget = newBudget()): Promise<string | null> {
@@ -745,13 +766,34 @@ async function syncPlayer(env: Env, id: string): Promise<Response> {
   return Response.json({ added: (await matchCount(env)) - before });
 }
 
-// Cron: pubs das contas vinculadas (até metade do orçamento, um lote de contas por chamada) e o EDL com o resto.
-// shortcut: sem rodízio, as contas que passam do que cabe no orçamento só sincronizam pelo botão de cada jogador.
-async function syncLinked(env: Env): Promise<void> {
+// Contadores do painel de sync, todos baratos (uma consulta); `done` do lote depende deles.
+async function syncStatus(env: Env): Promise<SyncStatus> {
+  const [counts, paused] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT (SELECT value_json FROM settings WHERE key = 'syncLastRun') AS last,
+         (SELECT COUNT(DISTINCT account_id) FROM players WHERE account_id IS NOT NULL) AS accounts,
+         (SELECT COUNT(DISTINCT p.account_id) ${STALE_FROM} WHERE ${STALE}) AS stale,
+         (SELECT COUNT(*) FROM edl_matches WHERE done = 0) AS pending,
+         (SELECT COUNT(*) FROM edl_scanned WHERE key NOT LIKE '%/%') AS scanned`,
+    ).bind(nowS() - SYNC_FRESH_S),
+    env.DB.prepare("SELECT substr(cache_key, 7) AS route, CAST(body AS INTEGER) AS until FROM api_cache WHERE cache_key LIKE 'pause:%' AND CAST(body AS INTEGER) > ? ORDER BY route").bind(nowS()),
+  ]);
+  const c = counts.results[0] as { last: string | null; accounts: number; stale: number; pending: number; scanned: number };
+  return {
+    ...(c.last ? { lastRunAt: Number(c.last) } : {}), accounts: c.accounts, staleAccounts: c.stale, pendingEdlMatches: c.pending, scannedEvents: c.scanned,
+    paused: paused.results as SyncStatus["paused"],
+  };
+}
+
+// Um lote cabe nos limites do Worker (subrequests) e da deadlock-api: pubs atrasados primeiro, depois o EDL com o que sobrou do orçamento.
+// done = nada mais a fazer agora (descoberta no fim, sem contas atrasadas, sem partidas pendentes e nenhuma rota em pausa).
+async function syncBatch(env: Env): Promise<{ status: SyncStatus; done: boolean }> {
   const budget = newBudget();
-  const ids = (await env.DB.prepare("SELECT DISTINCT account_id FROM players WHERE account_id IS NOT NULL ORDER BY account_id").all<{ account_id: number }>()).results.map((r) => r.account_id);
-  for (let i = 0; i < ids.length && budget.left > SUBREQUESTS / 2; i += PUB_ACCOUNTS) await syncPubs(env, ids.slice(i, i + PUB_ACCOUNTS), budget);
-  await syncEdl(env, budget);
+  await syncStalePubs(env, budget);
+  const discovered = await syncEdl(env, budget);
+  await env.DB.prepare("INSERT INTO settings (key, value_json) VALUES ('syncLastRun', ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json").bind(String(nowS())).run();
+  const status = await syncStatus(env);
+  return { status, done: discovered && !status.staleAccounts && !status.pendingEdlMatches && !status.paused.length };
 }
 
 async function appData(env: Env): Promise<Response> {
@@ -956,6 +998,10 @@ Enviado pelo site por **${nick ? noPing(nick) : "anônimo"}**.`;
   return Response.json({ url: issue.html_url });
 }
 
+// Mesma expressão do segundo item de triggers.crons (wrangler.jsonc). UTC 6h–8h50 = 3h–5h50 em Brasília (UTC−3, sem horário de verão):
+// madrugada, quando o site e a deadlock-api estão menos ocupados; a cada 10 min são 18 lotes por noite, cada um pequeno e sequencial.
+const SYNC_CRON = "*/10 6-8 * * *";
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1013,6 +1059,12 @@ export default {
       await syncEdl(env, newBudget());
       return Response.json({ total: (await env.DB.prepare("SELECT COUNT(*) AS n FROM edl_matches").first<number>("n")) ?? 0 });
     }
+    if (url.pathname === "/api/sync/status" || url.pathname === "/api/sync/run") {
+      if (!(await currentUser(env, request))?.admin) return bad("sem permissão", 403);
+      const run = url.pathname.endsWith("/run");
+      if (request.method !== (run ? "POST" : "GET")) return bad("método não suportado", 405);
+      return Response.json(run ? await syncBatch(env) : await syncStatus(env));
+    }
     if (url.pathname === "/api/edl/teams") {
       if (!(await currentUser(env, request))?.admin) return bad("sem permissão", 403);
       return request.method === "GET" ? edlTeamList(env, url.searchParams.get("q") ?? "") : bad("método não suportado", 405);
@@ -1056,8 +1108,11 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(syncFromDeadlockApi(env).then(() => syncLinked(env)));
-    ctx.waitUntil(env.DB.prepare("DELETE FROM api_cache WHERE cache_key LIKE 'feedback:%' AND fetched_at < unixepoch() - ?").bind(FEEDBACK_GAP_SECONDS).run());
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (controller.cron === SYNC_CRON) ctx.waitUntil(syncBatch(env));
+    else {
+      ctx.waitUntil(syncFromDeadlockApi(env));
+      ctx.waitUntil(env.DB.prepare("DELETE FROM api_cache WHERE cache_key LIKE 'feedback:%' AND fetched_at < unixepoch() - ?").bind(FEEDBACK_GAP_SECONDS).run());
+    }
   },
 } satisfies ExportedHandler<Env>;

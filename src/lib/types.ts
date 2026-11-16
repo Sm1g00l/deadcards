@@ -153,6 +153,16 @@ export type EdlTeamSeries = {
 
 export type EdlMatch = { matchId: number; event: string; series: string; game?: number; teams?: string; startTime?: number };
 
+// Estado do sync em lotes; `paused` lista as rotas externas em pausa por limite de requisições (until = unix s).
+export type SyncStatus = {
+  lastRunAt?: number;
+  accounts: number;
+  staleAccounts: number;
+  pendingEdlMatches: number;
+  scannedEvents: number;
+  paused: { route: string; until: number }[];
+};
+
 export type HeroArt = { name: string; url: string; zoom: number; x: number; y: number };
 
 export type TierBand = { key: string; min: number; max: number; bg: string; text: string };
