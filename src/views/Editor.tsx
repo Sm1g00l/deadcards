@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, useData } from "../lib/data";
 import { DEFAULT_TIER_CONFIG, POSITIONS, REGIONS, STAT_KEYS, calculateOVR, getPlayerHistory, getPlayerOvr, isMainCard } from "../lib/cards";
 import { FRAME_PRESETS, getCardTier, type Tier } from "../lib/rarity";
-import type { BackfillCandidate, BackfillResult, BgSettings, EdlImportResult, EdlMatch, EdlTeam, MatchLookup, MatchLookupPlayer, Player, Stats, Team, TierBand } from "../lib/types";
+import type { BackfillCandidate, BackfillResult, BgSettings, EdlImportResult, EdlMatch, EdlTeam, MatchLookup, MatchLookupPlayer, Player, Stats, SyncStatus, Team, TierBand } from "../lib/types";
 import { Card } from "../components/Card";
 import { TeamLogo } from "../components/TeamLogo";
 import { HoldButton } from "../components/HoldButton";
@@ -18,6 +18,7 @@ const SECTIONS = [
   { id: "heroes", label: "Heróis" },
   { id: "look", label: "Aparência" },
   { id: "codes", label: "Códigos" },
+  { id: "sync", label: "Sync" },
 ] as const;
 type Section = (typeof SECTIONS)[number]["id"];
 
@@ -102,6 +103,7 @@ export function Editor({ editId, onEditId }: { editId: string | null; onEditId: 
           {section === "heroes" && <HeroesForm />}
           {section === "look" && <LookForm />}
           {section === "codes" && <CodesForm />}
+          {section === "sync" && <SyncForm />}
         </motion.div>
       </AnimatePresence>
     </div>
@@ -1084,6 +1086,119 @@ function CodesForm() {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+// Entre lotes seguidos: a rota de metadata em lote da deadlock-api aceita 30 req/min por IP, então no máximo ~24 por minuto.
+const RUN_GAP_MS = 2500;
+const STUCK_RUNS = 3;
+const ROUTE_NAMES: Record<string, string> = {
+  "/v1/matches/metadata": "metadata de partidas (deadlock-api)",
+  "edl.gg": "edl.gg",
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const fmtTime = (ts: number) => new Date(ts * 1000).toLocaleTimeString("pt-BR", { timeStyle: "short" });
+
+function SyncForm() {
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [state, setState] = useState<{ busy: "" | "load" | "one" | "all"; msg: string; ok: boolean }>({ busy: "load", msg: "", ok: true });
+  const [progress, setProgress] = useState<{ run: number; total: number } | null>(null);
+  const stop = useRef(false);
+
+  useEffect(() => {
+    api.syncStatus().then((s) => { setStatus(s); setState({ busy: "", msg: "", ok: true }); }).catch((e: Error) => setState({ busy: "", msg: `Erro: ${e.message}`, ok: false }));
+    return () => { stop.current = true; };
+  }, []);
+
+  const left = (s: SyncStatus) => s.staleAccounts + s.pendingEdlMatches;
+  const summary = (s: SyncStatus) => `${plural(s.staleAccounts, "conta atrasada", "contas atrasadas")} e ${plural(s.pendingEdlMatches, "partida do EDL pendente", "partidas do EDL pendentes")}`;
+  const pausedText = (s: SyncStatus) => s.paused.map((p) => `${ROUTE_NAMES[p.route] ?? p.route} até ${fmtTime(p.until)}`).join("; ");
+
+  const one = async () => {
+    stop.current = false;
+    setState({ busy: "one", msg: "", ok: true });
+    try {
+      const { status: s, done } = await api.syncRun();
+      setStatus(s);
+      setState({ busy: "", msg: s.paused.length ? `Rota em pausa: ${pausedText(s)}` : done ? "Tudo em dia" : `Lote concluído: ${summary(s)}`, ok: !s.paused.length });
+    } catch (e) {
+      setState({ busy: "", msg: `Erro: ${(e as Error).message}`, ok: false });
+    }
+  };
+
+  // Cada chamada é uma execução separada do Worker (limite de subrequests por execução); para sozinho se uma rota entrar em pausa ou nada mais andar.
+  const all = async () => {
+    stop.current = false;
+    const total = status ? left(status) : 0;
+    let same = 0, prev = "";
+    for (let run = 1; ; run++) {
+      setState({ busy: "all", msg: `Rodando o lote ${run}…`, ok: true });
+      setProgress({ run, total });
+      try {
+        const { status: s, done } = await api.syncRun();
+        setStatus(s);
+        const sig = `${s.staleAccounts}/${s.pendingEdlMatches}/${s.scannedEvents}`;
+        same = sig === prev ? same + 1 : 0;
+        prev = sig;
+        const end = done ? "Tudo em dia" : s.paused.length ? `Parou: rota em pausa, ${pausedText(s)}` : stop.current ? `Parado: ${summary(s)}` : same >= STUCK_RUNS ? `Parou sem progresso: ${summary(s)}` : "";
+        if (end) return setState({ busy: "", msg: end, ok: done || stop.current });
+      } catch (e) {
+        return setState({ busy: "", msg: `Erro no lote ${run}: ${(e as Error).message}`, ok: false });
+      }
+      await wait(RUN_GAP_MS);
+      if (stop.current) return setState({ busy: "", msg: "Parado", ok: true });
+    }
+  };
+
+  const busy = state.busy !== "";
+  const pct = progress && status && progress.total ? Math.min(100, Math.round(((progress.total - left(status)) / progress.total) * 100)) : 0;
+  const stat = (label: string, value: string) => (
+    <div className="rounded-2xl border border-zinc-200/10 bg-zinc-900/60 px-4 py-3">
+      <dt className="text-[11px] font-bold tracking-wider text-zinc-400 uppercase">{label}</dt>
+      <dd className="mt-1 text-base font-extrabold text-zinc-100 sm:text-lg">{value}</dd>
+    </div>
+  );
+
+  return (
+    <div className="noir-glass space-y-6 rounded-3xl p-5 sm:p-7">
+      <div>
+        <h2 className="text-lg font-extrabold tracking-[0.12em] text-zinc-100 uppercase">Sincronização</h2>
+        <p className="mt-1 text-xs text-zinc-400">Roda sozinho toda madrugada (3h–6h de Brasília), em lotes pequenos para respeitar os limites da deadlock-api e do edl.gg. Use os botões para adiantar.</p>
+      </div>
+
+      <dl className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {stat("Última execução", status ? (status.lastRunAt ? fmtTs(status.lastRunAt) : "nunca") : "…")}
+        {stat("Contas atrasadas", status ? `${status.staleAccounts} de ${status.accounts}` : "…")}
+        {stat("Partidas do EDL pendentes", status ? String(status.pendingEdlMatches) : "…")}
+        {stat("Eventos do EDL varridos", status ? String(status.scannedEvents) : "…")}
+      </dl>
+
+      {status && status.paused.length > 0 && (
+        <p className="rounded-2xl border border-amber-300/30 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
+          Rota em pausa por limite de requisições: {pausedText(status)}. Os próximos lotes pulam essa rota até lá.
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button type="button" className={`${ghost} min-h-11`} disabled={busy || !status} onClick={one}>{state.busy === "one" ? "Rodando…" : "Rodar um lote"}</button>
+        {state.busy === "all"
+          ? <button type="button" className={`${danger} min-h-11`} onClick={() => { stop.current = true; setState((s) => ({ ...s, msg: "Parando depois do lote atual…" })); }}>Parar</button>
+          : <button type="button" className={`${primary} min-h-11`} disabled={busy || !status} onClick={all}>Atualizar tudo</button>}
+      </div>
+
+      {state.busy === "all" && progress && (
+        <div className="space-y-1.5">
+          <div role="progressbar" aria-label="Progresso da atualização" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} className="h-2 overflow-hidden rounded-full bg-zinc-800">
+            <motion.div className="h-full rounded-full bg-zinc-100" initial={false} animate={{ width: `${pct}%` }} transition={{ duration: 0.25 }} />
+          </div>
+          <p className="text-xs text-zinc-400">Lote {progress.run}{status ? ` · ${summary(status)}` : ""}</p>
+        </div>
+      )}
+
+      <p role="status" aria-live="polite" className={`text-sm ${state.busy ? "text-zinc-400" : state.ok ? "text-emerald-300" : "text-red-300"} ${state.msg || state.busy ? "" : "sr-only"}`}>
+        {state.busy === "load" ? "Carregando…" : state.msg}
+      </p>
     </div>
   );
 }

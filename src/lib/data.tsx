@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { AppData, BackfillCandidate, BackfillResult, EdlImportApply, EdlImportPreview, EdlImportResult, EdlMatch, EdlTeam, EdlTeamSeries, HeroArt, MatchLookup, PlayerMatch } from "./types";
+import type { AppData, BackfillCandidate, BackfillResult, EdlImportApply, EdlImportPreview, EdlImportResult, EdlMatch, EdlTeam, EdlTeamSeries, HeroArt, MatchLookup, PlayerMatch, SyncStatus } from "./types";
 import { DEFAULT_TIER_CONFIG } from "./cards";
 import { strings, useT } from "./i18n";
 
@@ -53,6 +53,8 @@ export const api = {
   playerMatches: async (id: string, source: "edl" | "pub") =>
     (await call(`/api/players/${encodeURIComponent(id)}/matches?source=${source}`, {})) as unknown as PlayerMatch[],
   syncMatches: async (id: string) => (await call(`/api/players/${encodeURIComponent(id)}/sync`, { method: "POST" })) as unknown as { added: number },
+  syncStatus: async () => (await call("/api/sync/status", {})) as unknown as SyncStatus,
+  syncRun: async () => (await call("/api/sync/run", { method: "POST" })) as unknown as { status: SyncStatus; done: boolean },
   upload: async (folder: "players" | "teams" | "heroes" | "bg" | "home", file: File) =>
     (await call(`/api/upload/${folder}`, { method: "POST", headers: { "content-type": file.type }, body: file })).url!,
 };
