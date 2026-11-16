@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { AppData, BackfillCandidate, BackfillResult, EdlMatch, HeroArt, MatchLookup, PlayerMatch } from "./types";
+import type { AppData, BackfillCandidate, BackfillResult, EdlImportApply, EdlImportPreview, EdlImportResult, EdlMatch, EdlTeam, EdlTeamSeries, HeroArt, MatchLookup, PlayerMatch } from "./types";
 import { DEFAULT_TIER_CONFIG } from "./cards";
 import { strings, useT } from "./i18n";
 
@@ -42,6 +42,11 @@ export const api = {
   matchLookup: async (matchId: number) => (await call(`/api/match-lookup/${matchId}`, {})) as unknown as MatchLookup,
   edlMatches: async () => (await call("/api/edl/matches", {})) as unknown as EdlMatch[],
   edlRefresh: async () => (await call("/api/edl/refresh", { method: "POST" })) as unknown as { total: number },
+  edlTeams: async (q = "") => (await call(`/api/edl/teams?q=${encodeURIComponent(q)}`, {})) as unknown as EdlTeam[],
+  edlImportPreview: async (teamId: string) => (await call(`/api/teams/${encodeURIComponent(teamId)}/edl-import`, {})) as unknown as EdlImportPreview,
+  edlImportApply: async (teamId: string, body: EdlImportApply) =>
+    (await call(`/api/teams/${encodeURIComponent(teamId)}/edl-import`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })) as unknown as EdlImportResult,
+  teamSeries: async (teamId: string) => (await call(`/api/teams/${encodeURIComponent(teamId)}/edl-series`, {})) as unknown as EdlTeamSeries[],
   backfillCandidates: async (id: string) => (await call(`/api/players/${encodeURIComponent(id)}/backfill`, {})) as unknown as BackfillCandidate[],
   backfillApply: async (id: string, playerIds: string[]) =>
     (await call(`/api/players/${encodeURIComponent(id)}/backfill`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playerIds }) })) as unknown as BackfillResult,

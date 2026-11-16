@@ -3,12 +3,13 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, useData } from "../lib/data";
 import { DEFAULT_TIER_CONFIG, POSITIONS, REGIONS, STAT_KEYS, calculateOVR, getPlayerHistory, getPlayerOvr, isMainCard } from "../lib/cards";
 import { FRAME_PRESETS, getCardTier, type Tier } from "../lib/rarity";
-import type { BackfillCandidate, BackfillResult, BgSettings, EdlMatch, MatchLookup, MatchLookupPlayer, Player, Stats, Team, TierBand } from "../lib/types";
+import type { BackfillCandidate, BackfillResult, BgSettings, EdlImportResult, EdlMatch, EdlTeam, MatchLookup, MatchLookupPlayer, Player, Stats, Team, TierBand } from "../lib/types";
 import { Card } from "../components/Card";
 import { TeamLogo } from "../components/TeamLogo";
 import { HoldButton } from "../components/HoldButton";
 import { Range } from "../components/Range";
 import { AUTOFOCUS, StepModal } from "../components/StepModal";
+import { EdlImportModal, EdlTeamBlock } from "../components/EdlTeam";
 import { danger, ghost, input, plural, primary, slugName } from "../lib/ui";
 
 const SECTIONS = [
@@ -703,14 +704,46 @@ function TeamsForm() {
   const save = () => {
     if (!d || !d.name.trim() || !d.tag.trim()) return;
     const id = d.id || newId("t");
-    run(async () => { await api.save("teams", id, { ...d, id, name: d.name.trim(), tag: d.tag.trim().toUpperCase().slice(0, 6) }); setD(null); }, `Time "${d.name}" salvo!`);
+    const t = { ...d, id, name: d.name.trim(), tag: d.tag.trim().toUpperCase().slice(0, 6) };
+    const pull = !d.id && !!d.edlSlug;
+    // edlSlug null desliga; ausente manteria o vínculo antigo.
+    run(async () => {
+      await api.save("teams", id, { ...t, edlSlug: d.edlSlug ?? null });
+      // Time novo ligado ao EDL abre a importação já com o time criado; os demais seguem abertos para editar.
+      setD(d.id || pull ? t : null);
+      if (pull) setImporting(t);
+    }, `Time "${t.name}" salvo!`);
   };
+  const [importing, setImporting] = useState<Team | null>(null);
+  // Anti-duplicação: o servidor recusa slug repetido (409); nome/tag iguais só pedem confirmação.
+  const [okKey, setOkKey] = useState("");
+  const squash = (s: string) => s.replace(/\s+/g, "").toLowerCase();
+  const dups = !d ? [] : teams.filter((t) => t.id !== d.id).flatMap((t) => {
+    const slug = !!d.edlSlug && t.edlSlug === d.edlSlug;
+    const why = [slug && "já está ligado a este time do EDL", !!squash(d.name) && squash(t.name) === squash(d.name) && "mesmo nome", !!squash(d.tag) && squash(t.tag) === squash(d.tag) && "mesma tag"].filter(Boolean);
+    return why.length ? [{ t, slug, why: why.join(" · ") }] : [];
+  });
+  const dupKey = dups.map((x) => x.t.id).join();
+  const blocked = dups.some((x) => x.slug);
+  const needsOk = !blocked && dups.length > 0 && okKey !== dupKey;
+  // Depois de importar, o formulário aberto recebe os campos aplicados sem perder o resto da edição.
+  const [applied, setApplied] = useState<EdlImportResult["applied"]["fields"]>([]);
+  const imported = (r: EdlImportResult) => setApplied(r.applied.fields);
+  useEffect(() => {
+    if (!applied.length) return;
+    const fresh = teams.find((t) => t.id === d?.id);
+    if (fresh) setD((t) => t && { ...t, ...Object.fromEntries(applied.map((f) => (f === "logo" ? ["logo", fresh.logo] : [f, fresh[f]]))) });
+    setApplied([]);
+  }, [applied, teams]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Time novo: escolher no EDL preenche nome, tag e região (a logo vem na importação, que grava no R2).
+  const onSlug = (edlSlug?: string, t?: EdlTeam) => set({ edlSlug, ...(t && !d?.id && { name: t.name.slice(0, 40), tag: (t.tag ?? d?.tag ?? "").slice(0, 6), region: t.region && REGIONS.includes(t.region) ? t.region : d?.region }) });
+  const edlBlock = d && <EdlTeamBlock team={d} savedSlug={teams.find((t) => t.id === d.id)?.edlSlug} onSlug={onSlug} onImported={imported} />;
   const remove = (t: Team) => {
     run(() => api.remove("teams", t.id), "Time excluído.");
   };
 
   return (
-    <div className="grid items-start gap-6 lg:grid-cols-2">
+    <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-6 lg:grid-cols-2">
       <div className="noir-glass space-y-2 rounded-3xl p-5">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-lg font-black tracking-[0.12em] text-white uppercase">Times ({teams.length})</h2>
@@ -718,7 +751,7 @@ function TeamsForm() {
         </div>
         {teams.map((t) => (
           <motion.div layout key={t.id} className="flex items-center gap-3 rounded-xl border border-zinc-200/10 bg-zinc-950/50 p-2.5">
-            <div className="size-10 shrink-0"><TeamLogo team={t} /></div>
+            <div className="team-logo-frame size-10"><TeamLogo team={t} /></div>
             <div className="min-w-0 flex-1">
               <p className="truncate font-bold text-zinc-100">{t.name} <span className="text-zinc-400">({t.tag})</span></p>
               <p className="text-xs text-zinc-400">{t.region} · {players.filter((p) => p.teamId === t.id).length} cartas</p>
@@ -733,6 +766,7 @@ function TeamsForm() {
         {d && (
           <motion.div key={d.id || "new"} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} className="noir-glass space-y-4 rounded-3xl p-5">
             <h3 className="text-lg font-black tracking-[0.12em] text-white uppercase">{d.id ? `Editar ${d.name}` : "Novo time"}</h3>
+            {!d.id && edlBlock}
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Nome"><input className={input} value={d.name} maxLength={40} onChange={(e) => set({ name: e.target.value })} /></Field>
               <Field label="Tag"><input className={input} value={d.tag} maxLength={6} onChange={(e) => set({ tag: e.target.value })} /></Field>
@@ -742,20 +776,44 @@ function TeamsForm() {
                 </select>
               </Field>
               <div className="flex items-end gap-3">
-                {d.logo && <div className="size-12"><TeamLogo team={d} /></div>}
+                {d.logo && <div className="team-logo-frame size-12"><TeamLogo team={d} /></div>}
                 <ImagePick folder="teams" label="Logo" onUrl={(logo) => set({ logo })} />
                 {d.logo && <button type="button" className={ghost} onClick={() => set({ logo: undefined })}>Remover</button>}
               </div>
             </div>
+            {d.id && edlBlock}
             <BgFields bg={d.bg} onChange={(bg) => set({ bg })} folder="teams" title="Fundo do time" />
+            <AnimatePresence initial={false}>
+              {dups.length > 0 && (
+                <motion.div key={dupKey} initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} role="alert" className="space-y-3 rounded-2xl border border-amber-200/25 bg-amber-200/5 p-4">
+                  <p className="text-sm font-bold text-amber-100">{blocked ? "Este time do EDL já está cadastrado." : "Já existe um time parecido."}</p>
+                  <ul className="space-y-2">
+                    {dups.map(({ t, why }) => (
+                      <li key={t.id} className="flex flex-wrap items-center gap-3">
+                        <div className="team-logo-frame size-10"><TeamLogo team={t} /></div>
+                        <p className="min-w-40 flex-1 text-sm text-amber-100/90"><strong className="text-zinc-100">{t.name}</strong> ({t.tag}): {why}.</p>
+                        <button type="button" className={`${ghost} min-h-11`} onClick={() => setD(structuredClone(t))}>Editar {t.name}</button>
+                      </li>
+                    ))}
+                  </ul>
+                  {blocked ? <p className="text-xs text-amber-100/80">Salvar está desabilitado: edite o time existente em vez de criar outro.</p> : (
+                    <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm text-zinc-100 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-zinc-100">
+                      <input type="checkbox" className="size-5 shrink-0 cursor-pointer accent-dl-text" checked={okKey === dupKey} onChange={(e) => setOkKey(e.target.checked ? dupKey : "")} />
+                      {d.id ? "Salvar mesmo assim" : "Criar mesmo assim"}
+                    </label>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
             <div className="flex flex-wrap items-center gap-3">
-              <button type="button" className={primary} disabled={busy || !d.name.trim() || !d.tag.trim()} onClick={save}>{busy ? "Salvando…" : "Salvar time"}</button>
+              <button type="button" className={primary} disabled={busy || !d.name.trim() || !d.tag.trim() || blocked || needsOk} onClick={save}>{busy ? "Salvando…" : "Salvar time"}</button>
               <button type="button" className={ghost} onClick={() => setD(null)}>Cancelar</button>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
       <div className="lg:col-span-2"><Toast msg={msg} /></div>
+      {importing && <EdlImportModal team={importing} onClose={() => setImporting(null)} onApplied={imported} />}
     </div>
   );
 }
@@ -847,7 +905,7 @@ function LookForm() {
   const setTier = (i: number, patch: Partial<TierBand>) => setTiers((t) => t.map((x, j) => (j === i ? { ...x, ...patch } : x)));
 
   return (
-    <div className="grid items-start gap-6 lg:grid-cols-2">
+    <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-6 lg:grid-cols-2">
       <div className="noir-glass space-y-5 rounded-3xl p-5">
         <h2 className="text-lg font-black tracking-[0.12em] text-white uppercase">Fundo e capa</h2>
         <BgFields bg={bg} onChange={setBg} folder="bg" title="Fundo do site" />
